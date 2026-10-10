@@ -3,3 +3,4 @@ __pycache__/
 # converted outputs
 out/
 *.bin
+.last_ip

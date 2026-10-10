@@ -29,10 +29,21 @@ Requires Pillow (pip install pillow). Tkinter ships with Python.
 """
 import argparse
 import os
+import socket
+import struct
 import sys
 import tempfile
+import threading
 
 from PIL import Image, ImageEnhance, ImageOps
+
+TCP_PORT = 8319                                        # firmware listens here
+IP_MEMO = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_ip")
+
+
+def _hdr(cmd, color, x, y, w, h):
+    """10-byte little-endian command header the firmware expects."""
+    return struct.pack("<BBHHHH", cmd, color, x, y, w, h)
 
 # ---------------------------------------------------------------------------
 #  Panel presets - bitmap W x H as the panel vendors state them
@@ -216,6 +227,22 @@ def run_cli(a):
 # ---------------------------------------------------------------------------
 #  GUI
 # ---------------------------------------------------------------------------
+def _load_ip():
+    try:
+        with open(IP_MEMO) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _save_ip(ip):
+    try:
+        with open(IP_MEMO, "w") as f:
+            f.write(ip.strip())
+    except OSError:
+        pass
+
+
 def run_gui(initial=None):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -290,6 +317,18 @@ def run_gui(initial=None):
     ttk.Separator(side).pack(fill="x", pady=8)
     ttk.Button(side, text="BMP 저장 (24-bit, 툴 입력용)…", command=lambda: save("bmp")).pack(fill="x", pady=2)
     ttk.Button(side, text="RAW 저장 (4bpp, 펌웨어 포맷)…", command=lambda: save("raw")).pack(fill="x", pady=2)
+
+    ttk.Separator(side).pack(fill="x", pady=8)
+    f = row("보드 IP")
+    ip_var = tk.StringVar(value=_load_ip())
+    ttk.Entry(f, textvariable=ip_var, width=16).pack(side="left", fill="x", expand=True)
+    clr_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(side, text="전송 전 흰색으로 지우기", variable=clr_var).pack(anchor="w")
+    send_btn = ttk.Button(side, text="▶ 보드로 전송", command=lambda: do_send())
+    send_btn.pack(fill="x", pady=(2, 0))
+    send_lbl = ttk.Label(side, text="IP 입력 후 전송 (포트 8319)", foreground="#777", wraplength=244)
+    send_lbl.pack(fill="x", pady=(2, 0))
+
     info = ttk.Label(side, text="", foreground="#444", justify="left", wraplength=244); info.pack(fill="x", pady=(12, 0))
 
     right = ttk.Frame(root, padding=(0, 10, 10, 10)); right.pack(side="right", fill="both", expand=True)
@@ -527,6 +566,50 @@ def run_gui(initial=None):
             p = filedialog.asksaveasfilename(defaultextension=".bin", initialfile=f"{base}_{w}x{h}_4bpp.bin",
                                              filetypes=[("4bpp raw", "*.bin")])
             if p: save_raw(st["levels"], p); status.config(text=f"저장됨: {p}  ({w*h//2:,} B)")
+
+    # ---- send to the board (background thread) ---------------------------
+    def send_post(msg, color="#444"):
+        send_lbl.config(text=msg, foreground=color)
+
+    def send_done():
+        send_btn.config(state="normal", text="▶ 보드로 전송")
+
+    def send_worker(ip, w, h, payload, clear):
+        try:
+            root.after(0, send_post, f"접속 중 {ip}:{TCP_PORT} …")
+            with socket.create_connection((ip, TCP_PORT), timeout=8) as s:
+                s.settimeout(20)
+                if clear:
+                    s.sendall(_hdr(1, 0x0F, 0, 0, w, h))
+                    s.sendall(_hdr(4, 0, 0, 0, w, h))
+                    root.after(0, send_post, "흰색으로 지움 …")
+                s.sendall(_hdr(2, 0x0F, 0, 0, w, h))
+                total, sent, CH = len(payload), 0, 8192
+                while sent < total:
+                    s.sendall(payload[sent:sent + CH]); sent += CH
+                    sent = min(sent, total)
+                    if sent % (CH * 32) == 0 or sent == total:
+                        root.after(0, send_post, f"전송 {sent*100//total}%  ({sent:,}/{total:,} B)")
+                s.sendall(_hdr(4, 0, 0, 0, w, h))
+            root.after(0, send_post, "완료 ✓ 화면 갱신됨", "#1a7a1a")
+        except Exception as e:                          # noqa
+            root.after(0, send_post, f"전송 실패: {e}", "#c0392b")
+        finally:
+            root.after(0, send_done)
+
+    def do_send():
+        if st["levels"] is None:
+            messagebox.showinfo("전송", "먼저 이미지를 열어주세요."); return
+        ip = ip_var.get().strip()
+        if not ip:
+            messagebox.showinfo("전송", "보드 IP를 입력하세요 (부팅 로그 / CLI의 wifi)."); return
+        _save_ip(ip)
+        w, h = st["levels"].size
+        payload = pack_4bpp(st["levels"])
+        send_btn.config(state="disabled", text="전송 중…")
+        send_post(f"{w}x{h}, {len(payload):,} B 전송 시작…")
+        threading.Thread(target=send_worker, args=(ip, w, h, payload, clr_var.get()),
+                         daemon=True).start()
 
     def on_mode(*_):
         if st["sync"]:
