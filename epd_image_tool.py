@@ -164,6 +164,28 @@ def convert(img, size, *, rotate=0, mode="fit", scale=None, off=None, pad_white=
     return levels, display, meta
 
 
+def gray_ramp(size):
+    """16 horizontal bands, each a solid level 0..15 (gray k*17), labelled.
+    A diagnostic: send it and photograph the panel to see how the 16 levels
+    actually render (even spacing / non-linear / fewer effective levels)."""
+    from PIL import ImageDraw, ImageFont
+    w, h = size
+    im = Image.new("L", (w, h), 255)
+    d = ImageDraw.Draw(im)
+    try:
+        font = ImageFont.truetype("arialbd.ttf", max(12, h // 22))
+    except OSError:
+        font = ImageFont.load_default()
+    bh = h // 16
+    for k in range(16):
+        g = k * 17
+        y0, y1 = k * bh, ((k + 1) * bh if k < 15 else h)
+        d.rectangle([0, y0, w, y1], fill=g)
+        d.text((20, y0 + bh // 2 - h // 44), f"{k}  ({g})",
+               fill=(0 if g > 130 else 255), font=font)
+    return im                                           # mode "L", already 16-level
+
+
 def pack_4bpp(levels_img):
     """Two pixels per byte, first pixel in the high nibble."""
     data = levels_img.tobytes()
@@ -655,6 +677,8 @@ def run_gui(initial=None):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--grayramp", metavar="OUT.bmp",
+                    help="write a labelled 16-level gray-ramp diagnostic (needs --panel/--size)")
     ap.add_argument("--cli", metavar="INPUT", help="convert without the GUI")
     ap.add_argument("--open", metavar="INPUT", help="start the GUI with this image loaded")
     ap.add_argument("--panel", default="6", help="6 | 7.8 | 10.3")
@@ -677,6 +701,14 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.selftest:
         selftest()
+    elif a.grayramp:
+        size = PANEL_BY_INCH.get(a.panel)
+        if a.size:
+            size = tuple(int(v) for v in a.size.lower().split("x"))
+        if size is None:
+            ap.error("--grayramp needs --panel 6|7.8|10.3 or --size WxH")
+        save_bmp(gray_ramp(size), a.grayramp)
+        print(f"wrote {a.grayramp}  ({size[0]}x{size[1]} gray ramp)")
     elif a.cli:
         run_cli(a)
     else:
