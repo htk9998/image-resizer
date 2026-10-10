@@ -48,11 +48,12 @@ PANEL_BY_INCH = {"6": (1072, 1448), "7.8": (1872, 1404), "10.3": (1872, 1404)}
 MODES = {
     "fit (여백)":       "fit",
     "fill (잘라냄)":    "fill",
-    "가로 꽉 (width)":  "width",
-    "세로 꽉 (height)": "height",
+    "가로 (width)":     "width",
+    "세로 (height)":    "height",
     "stretch (늘림)":   "stretch",
     "수동 (줌/드래그)": "manual",
 }
+MODE_MANUAL = "수동 (줌/드래그)"
 LEVELS = 16
 
 # 16-entry gray palette image used for dithered quantisation
@@ -227,8 +228,8 @@ def run_gui(initial=None):
 
     st = {"src": None, "src_path": None, "src_gray": None, "levels": None,
           "display": None, "job": None, "out_scale": 1.0, "out_pos": (0, 0),
-          "man_scale": 1.0, "man_off": None, "drag": None, "dragging": False,
-          "sync": False}
+          "man_scale": 1.0, "man_off": None, "cur_scale": 1.0, "cur_off": (0, 0),
+          "drag": None, "dragging": False, "sync": False}
 
     side = ttk.Frame(root, padding=10); side.pack(side="left", fill="y")
 
@@ -371,11 +372,14 @@ def run_gui(initial=None):
         schedule()
 
     def go_manual_from_current():
-        """Seed manual scale/offset from whatever is on screen right now."""
+        """Switch to manual WITHOUT changing size or position: seed the manual
+        scale/offset from whatever the current mode just resolved to."""
         if st["src"] is None:
             return
+        st["man_scale"] = st["cur_scale"] or st["man_scale"]
+        st["man_off"] = st["cur_off"] if st["cur_off"] is not None else st["man_off"]
         st["sync"] = True
-        mode_var.set("수동 (줌/드래그)")
+        mode_var.set(MODE_MANUAL)
         st["sync"] = False
 
     def on_zoom(*_):
@@ -407,6 +411,11 @@ def run_gui(initial=None):
             status.config(text=f"변환 오류: {e}"); return
         st["levels"], st["display"] = lv, disp
         st["out_scale"], st["out_pos"] = draw(cv_out, disp, "out")
+        # Remember what this mode actually resolved to, so a later switch to
+        # manual (drag / zoom) can start from the exact same size and place.
+        iw, ih = meta["src"]
+        st["cur_scale"] = meta["scale"] if meta["scale"] else base_scale(iw, ih, size, "fit")
+        st["cur_off"] = meta["off"]
         # reflect the resolved scale back onto the zoom knob (without recursing)
         if meta["scale"]:
             st["sync"] = True; zoom_var.set(round(meta["scale"] * 100)); st["sync"] = False
