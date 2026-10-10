@@ -225,8 +225,8 @@ def run_gui(initial=None):
     root.geometry("1180x740")
     root.minsize(960, 580)
 
-    st = {"src": None, "src_path": None, "levels": None, "display": None,
-          "job": None, "out_scale": 1.0, "out_pos": (0, 0),
+    st = {"src": None, "src_path": None, "src_gray": None, "levels": None,
+          "display": None, "job": None, "out_scale": 1.0, "out_pos": (0, 0),
           "man_scale": 1.0, "man_off": None, "drag": None, "dragging": False,
           "sync": False}
 
@@ -319,6 +319,17 @@ def run_gui(initial=None):
     def cur_mode():
         return MODES[mode_var.get()]
 
+    def rebuild_gray():
+        """Rotated grayscale source kept for the fast drag preview."""
+        if st["src"] is None:
+            st["src_gray"] = None
+            return
+        g = ImageOps.exif_transpose(st["src"]).convert("L")
+        r = int(rot_var.get())
+        if r:
+            g = g.rotate(-r, expand=True)
+        st["src_gray"] = g
+
     def target_size():
         try:
             w, h = int(w_var.get()), int(h_var.get())
@@ -346,6 +357,7 @@ def run_gui(initial=None):
             messagebox.showerror("열기 실패", str(e)); return
         st["src"], st["src_path"] = img, p
         st["man_off"] = None
+        rebuild_gray()
         src_lbl.config(text=f"{os.path.basename(p)}\n{img.width} x {img.height}  {img.mode}")
         draw(cv_src, img.convert("RGB"), "src")
         schedule()
@@ -413,6 +425,36 @@ def run_gui(initial=None):
             root.after_cancel(st["job"])
         st["job"] = root.after(100, render)
 
+    def drag_preview():
+        """Cheap canvas-resolution preview + red outline while dragging.
+        Avoids the full resize+quantise of the panel-sized output per motion."""
+        g = st["src_gray"]
+        size = target_size()
+        if g is None or size is None:
+            return
+        w, h = size
+        cw, ch = max(cv_out.winfo_width(), 50), max(cv_out.winfo_height(), 50)
+        view = min(cw / w, ch / h, 1.0)
+        pw, ph = max(1, round(w * view)), max(1, round(h * view))
+        pad = 255 if pad_var.get() == "흰색" else 0
+        prev = Image.new("L", (pw, ph), pad)
+        iw, ih = g.size
+        s = st["man_scale"] * view
+        sw, sh = max(1, round(iw * s)), max(1, round(ih * s))
+        scaled = g.resize((sw, sh), Image.BILINEAR)         # fast
+        ox, oy = st["man_off"]
+        px, py = round(ox * view), round(oy * view)
+        prev.paste(scaled, (px, py))
+
+        cv_out.delete("all")
+        photos["out"] = ImageTk.PhotoImage(prev)
+        x0, y0 = (cw - pw) // 2, (ch - ph) // 2
+        cv_out.create_image(x0, y0, image=photos["out"], anchor="nw")
+        cv_out.create_rectangle(x0, y0, x0 + pw - 1, y0 + ph - 1, outline="#9a9a9a")
+        cv_out.create_rectangle(x0 + px, y0 + py, x0 + px + sw, y0 + py + sh,
+                                outline="red", width=2)
+        st["out_scale"], st["out_pos"] = view, (x0, y0)
+
     # ---- drag on the result canvas ---------------------------------------
     def drag_start(ev):
         if st["src"] is None:
@@ -428,6 +470,9 @@ def run_gui(initial=None):
             st["man_off"] = (ox, oy)
         st["drag"] = (ev.x, ev.y, st["man_off"])
         st["dragging"] = True
+        if st["job"]:                                  # cancel any pending full render
+            root.after_cancel(st["job"]); st["job"] = None
+        drag_preview()
 
     def drag_move(ev):
         if not st["drag"]:
@@ -435,13 +480,13 @@ def run_gui(initial=None):
         x0, y0, (ox, oy) = st["drag"]
         sc = st["out_scale"] or 1.0
         st["man_off"] = (round(ox + (ev.x - x0) / sc), round(oy + (ev.y - y0) / sc))
-        schedule()
+        drag_preview()                                 # cheap; no full convert
 
     def drag_end(ev):
         st["drag"] = None
         if st["dragging"]:
             st["dragging"] = False
-            schedule()                                 # final render with dithering
+            render()                                   # final full render (dither, 16-level)
 
     def center_image(ev=None):
         if st["src"] is None:
@@ -484,6 +529,7 @@ def run_gui(initial=None):
     def on_zoom_lbl(*_):
         zoom_lbl.config(text=f"{int(zoom_var.get())}%")
 
+    rot_var.trace_add("write", lambda *_: rebuild_gray())
     panel_var.trace_add("write", on_panel)
     mode_var.trace_add("write", on_mode)
     zoom_var.trace_add("write", on_zoom)
