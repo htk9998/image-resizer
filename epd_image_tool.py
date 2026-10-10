@@ -35,7 +35,7 @@ import sys
 import tempfile
 import threading
 
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 TCP_PORT = 8319                                        # firmware listens here
 IP_MEMO = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_ip")
@@ -103,7 +103,8 @@ def resolve_layout(iw, ih, size, mode, scale=None, off=None):
 #  Conversion core (no GUI)
 # ---------------------------------------------------------------------------
 def convert(img, size, *, rotate=0, mode="fit", scale=None, off=None, pad_white=True,
-            brightness=0, contrast=0, gamma=1.0, dither=True, invert=False):
+            brightness=0, contrast=0, gamma=1.0, autocontrast=False, sharpen=0,
+            dither=True, invert=False):
     """
     Return (levels_img, display_img, meta):
       levels_img  - "L", each pixel is its 4-bit level 0..15
@@ -132,6 +133,11 @@ def convert(img, size, *, rotate=0, mode="fit", scale=None, off=None, pad_white=
         meta = {"scale": s, "off": (ox, oy), "src": (iw, ih)}
 
     gray = placed.convert("L")
+    # Stretch the histogram first so the rest works on full 0..255 range. The
+    # padding border is excluded from the measurement (cutoff) so a big white
+    # letterbox doesn't flatten the stretch.
+    if autocontrast:
+        gray = ImageOps.autocontrast(gray, cutoff=1)
     if brightness:
         gray = ImageEnhance.Brightness(gray).enhance(1 + brightness / 100.0)
     if contrast:
@@ -139,6 +145,10 @@ def convert(img, size, *, rotate=0, mode="fit", scale=None, off=None, pad_white=
     if gamma and abs(gamma - 1.0) > 1e-3:
         lut = [round(255 * ((i / 255.0) ** (1.0 / gamma))) for i in range(256)]
         gray = gray.point(lut)
+    # Sharpen last, before quantisation: e-paper softens edges, so an unsharp
+    # mask makes text and detail read far better. percent scales the amount.
+    if sharpen > 0:
+        gray = gray.filter(ImageFilter.UnsharpMask(radius=2, percent=int(sharpen * 1.5), threshold=2))
     if invert:
         gray = ImageOps.invert(gray)
 
@@ -216,8 +226,8 @@ def run_cli(a):
     scale = (a.scale / 100.0) if a.scale else None
     lv, disp, meta = convert(img, size, rotate=a.rotate, mode=a.mode, scale=scale, off=off,
                              pad_white=not a.pad_black, brightness=a.brightness,
-                             contrast=a.contrast, gamma=a.gamma, dither=not a.no_dither,
-                             invert=a.invert)
+                             contrast=a.contrast, gamma=a.gamma, autocontrast=a.autocontrast,
+                             sharpen=a.sharpen, dither=not a.no_dither, invert=a.invert)
     if a.out:
         save_bmp(disp, a.out); print(f"wrote {a.out}  ({size[0]}x{size[1]} 24-bit BMP, scale={meta['scale']})")
     if a.raw:
@@ -307,9 +317,12 @@ def run_gui(initial=None):
     bri_var = tk.DoubleVar(value=0);   slider("밝기", bri_var, -100, 100)
     con_var = tk.DoubleVar(value=0);   slider("대비", con_var, -100, 100)
     gam_var = tk.DoubleVar(value=1.0); slider("감마", gam_var, 0.3, 3.0, res=0.01)
+    shp_var = tk.DoubleVar(value=0);   slider("샤픈", shp_var, 0, 100)
 
+    ac_var = tk.BooleanVar(value=False)
     dith_var = tk.BooleanVar(value=True); inv_var = tk.BooleanVar(value=False)
     f = ttk.Frame(side); f.pack(fill="x", pady=6)
+    ttk.Checkbutton(f, text="자동 대비 (히스토그램)", variable=ac_var).pack(anchor="w")
     ttk.Checkbutton(f, text="디더링 (Floyd-Steinberg)", variable=dith_var).pack(anchor="w")
     ttk.Checkbutton(f, text="반전", variable=inv_var).pack(anchor="w")
     ttk.Button(side, text="초기화", command=lambda: reset_adjust()).pack(fill="x", pady=(2, 8))
@@ -404,8 +417,8 @@ def run_gui(initial=None):
 
     def reset_adjust():
         st["sync"] = True
-        bri_var.set(0); con_var.set(0); gam_var.set(1.0); zoom_var.set(100)
-        dith_var.set(True); inv_var.set(False); rot_var.set("0")
+        bri_var.set(0); con_var.set(0); gam_var.set(1.0); shp_var.set(0); zoom_var.set(100)
+        ac_var.set(False); dith_var.set(True); inv_var.set(False); rot_var.set("0")
         mode_var.set(list(MODES)[0]); pad_var.set("흰색")
         st["man_off"] = None; st["sync"] = False
         schedule()
@@ -445,7 +458,8 @@ def run_gui(initial=None):
             lv, disp, meta = convert(st["src"], size, rotate=int(rot_var.get()), mode=mode,
                                      scale=scale, off=off, pad_white=(pad_var.get() == "흰색"),
                                      brightness=bri_var.get(), contrast=con_var.get(),
-                                     gamma=gam_var.get(), dither=use_dither, invert=inv_var.get())
+                                     gamma=gam_var.get(), autocontrast=ac_var.get(),
+                                     sharpen=shp_var.get(), dither=use_dither, invert=inv_var.get())
         except Exception as e:
             status.config(text=f"변환 오류: {e}"); return
         st["levels"], st["display"] = lv, disp
@@ -626,7 +640,8 @@ def run_gui(initial=None):
     mode_var.trace_add("write", on_mode)
     zoom_var.trace_add("write", on_zoom)
     zoom_var.trace_add("write", on_zoom_lbl); on_zoom_lbl()
-    for v in (w_var, h_var, rot_var, pad_var, bri_var, con_var, gam_var, dith_var, inv_var):
+    for v in (w_var, h_var, rot_var, pad_var, bri_var, con_var, gam_var, shp_var,
+              ac_var, dith_var, inv_var):
         v.trace_add("write", schedule)
     cv_src.bind("<Configure>", lambda e: draw(cv_src, st["src"].convert("RGB") if st["src"] else None, "src"))
     cv_out.bind("<Configure>", lambda e: schedule())
@@ -655,6 +670,8 @@ if __name__ == "__main__":
     ap.add_argument("--brightness", type=float, default=0)
     ap.add_argument("--contrast", type=float, default=0)
     ap.add_argument("--gamma", type=float, default=1.0)
+    ap.add_argument("--autocontrast", action="store_true", help="stretch histogram to full range")
+    ap.add_argument("--sharpen", type=float, default=0, help="unsharp amount 0..100")
     ap.add_argument("--no-dither", action="store_true")
     ap.add_argument("--invert", action="store_true")
     a = ap.parse_args()
