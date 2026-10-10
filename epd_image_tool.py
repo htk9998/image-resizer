@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
 EPD Image Tool - resize any picture to an e-paper panel and quantise it to
-16 gray levels, with a live preview of the result.
+16 gray levels, with a live preview you can zoom and drag into place.
 
 Standalone; nothing in the firmware depends on it.
 
     python epd_image_tool.py                      # GUI
+    python epd_image_tool.py --open IN            # GUI with an image loaded
     python epd_image_tool.py --selftest           # exercise the converter
     python epd_image_tool.py --cli IN --panel 6 --out out.bmp [--raw out.bin]
 
+Fit modes
+    fit       whole image inside the panel, letterboxed (upscales small images)
+    fill      cover the panel, crop the overflow
+    width     match the panel width exactly (height may crop or letterbox)
+    height    match the panel height exactly
+    stretch   distort to the exact panel size
+    manual    free zoom + position (set by the zoom slider or by dragging)
+
 Outputs
-    .bmp   24-bit, R=G=B, values 0,17,34..255 (16 steps). This is what the
-           legacy PC tools (EPDdemo / EPDctrl) load.
+    .bmp   24-bit, R=G=B, values 0,17,34..255 (16 steps). What the legacy PC
+           tools (EPDdemo / EPDctrl) load.
     .bin   4 bits per pixel, two pixels per byte, first pixel in the HIGH
-           nibble, 0 = black .. 15 = white. Exactly the stream the firmware
-           pushes into the IT8951 image buffer.
+           nibble, 0 = black .. 15 = white. The stream the firmware pushes
+           into the IT8951 image buffer.
 
 Requires Pillow (pip install pillow). Tkinter ships with Python.
 """
@@ -36,7 +45,14 @@ PANELS = {
 }
 PANEL_BY_INCH = {"6": (1072, 1448), "7.8": (1872, 1404), "10.3": (1872, 1404)}
 
-FIT_MODES = ("fit (여백)", "fill (잘라냄)", "stretch (늘림)")
+MODES = {
+    "fit (여백)":       "fit",
+    "fill (잘라냄)":    "fill",
+    "가로 꽉 (width)":  "width",
+    "세로 꽉 (height)": "height",
+    "stretch (늘림)":   "stretch",
+    "수동 (줌/드래그)": "manual",
+}
 LEVELS = 16
 
 # 16-entry gray palette image used for dithered quantisation
@@ -45,14 +61,42 @@ _PAL.putpalette([v for i in range(LEVELS) for v in (i * 17,) * 3] + [0] * (768 -
 
 
 # ---------------------------------------------------------------------------
+#  Layout: resolve (scale, offset) for a mode, or accept manual values
+# ---------------------------------------------------------------------------
+def base_scale(iw, ih, size, mode):
+    """Uniform scale a preset mode would use (manual/stretch excluded)."""
+    w, h = size
+    if mode == "fill":
+        return max(w / iw, h / ih)
+    if mode == "width":
+        return w / iw
+    if mode == "height":
+        return h / ih
+    return min(w / iw, h / ih)                         # fit
+
+
+def resolve_layout(iw, ih, size, mode, scale=None, off=None):
+    """Return (scale, off_x, off_y). Centre presets; pass manual through."""
+    w, h = size
+    if mode == "manual":
+        s = scale if scale else base_scale(iw, ih, size, "fit")
+        if off is not None:
+            return s, off[0], off[1]
+        return s, round((w - iw * s) / 2), round((h - ih * s) / 2)
+    s = base_scale(iw, ih, size, mode)
+    return s, round((w - iw * s) / 2), round((h - ih * s) / 2)
+
+
+# ---------------------------------------------------------------------------
 #  Conversion core (no GUI)
 # ---------------------------------------------------------------------------
-def convert(img, size, *, rotate=0, fit="fit", pad_white=True,
+def convert(img, size, *, rotate=0, mode="fit", scale=None, off=None, pad_white=True,
             brightness=0, contrast=0, gamma=1.0, dither=True, invert=False):
     """
-    Return (levels_img, display_img):
-      levels_img  - mode "L", each pixel is its 4-bit level 0..15
-      display_img - mode "L", each pixel is level*17 (what you see / save)
+    Return (levels_img, display_img, meta):
+      levels_img  - "L", each pixel is its 4-bit level 0..15
+      display_img - "L", each pixel is level*17 (what you see / save)
+      meta        - dict(scale, off, src=(iw,ih)) actually used
     """
     w, h = size
     if w % 2:
@@ -60,19 +104,22 @@ def convert(img, size, *, rotate=0, fit="fit", pad_white=True,
 
     im = ImageOps.exif_transpose(img).convert("RGB")
     if rotate:
-        im = im.rotate(-rotate, expand=True)          # clockwise degrees
+        im = im.rotate(-rotate, expand=True)           # clockwise degrees
+    iw, ih = im.size
 
-    if fit == "stretch":
-        im = im.resize((w, h), Image.LANCZOS)
-    elif fit == "fill":
-        im = ImageOps.fit(im, (w, h), Image.LANCZOS, centering=(0.5, 0.5))
-    else:                                              # fit
-        im.thumbnail((w, h), Image.LANCZOS)
-        canvas = Image.new("RGB", (w, h), (255, 255, 255) if pad_white else (0, 0, 0))
-        canvas.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
-        im = canvas
+    pad = (255, 255, 255) if pad_white else (0, 0, 0)
+    if mode == "stretch":
+        placed = im.resize((w, h), Image.LANCZOS)
+        meta = {"scale": None, "off": (0, 0), "src": (iw, ih)}
+    else:
+        s, ox, oy = resolve_layout(iw, ih, size, mode, scale, off)
+        sw, sh = max(1, round(iw * s)), max(1, round(ih * s))
+        scaled = im.resize((sw, sh), Image.LANCZOS)
+        placed = Image.new("RGB", (w, h), pad)
+        placed.paste(scaled, (ox, oy))
+        meta = {"scale": s, "off": (ox, oy), "src": (iw, ih)}
 
-    gray = im.convert("L")
+    gray = placed.convert("L")
     if brightness:
         gray = ImageEnhance.Brightness(gray).enhance(1 + brightness / 100.0)
     if contrast:
@@ -85,27 +132,25 @@ def convert(img, size, *, rotate=0, fit="fit", pad_white=True,
 
     if dither:
         q = gray.convert("RGB").quantize(palette=_PAL, dither=Image.Dither.FLOYDSTEINBERG)
-        # Go through the palette to the actual gray (0,17,..,255) and divide back
-        # down to the level. This is robust to Pillow picking any of the padded
-        # duplicate black entries (index >= 16) for a black pixel.
+        # Through the palette gray (0,17,..) back to the level; robust to Pillow
+        # choosing any of the padded duplicate black entries (index >= 16).
         levels = q.convert("L").point([round(v / 17) for v in range(256)])
     else:
         levels = gray.point([i // 16 for i in range(256)])
 
     display = levels.point([min(255, i * 17) for i in range(256)])
-    return levels, display
+    return levels, display, meta
 
 
 def pack_4bpp(levels_img):
     """Two pixels per byte, first pixel in the high nibble."""
     data = levels_img.tobytes()
-    hi = data[0::2]
-    lo = data[1::2]
+    hi, lo = data[0::2], data[1::2]
     return bytes(((a & 0x0F) << 4) | (b & 0x0F) for a, b in zip(hi, lo))
 
 
 def save_bmp(display_img, path):
-    display_img.convert("RGB").save(path, "BMP")       # 24-bit
+    display_img.convert("RGB").save(path, "BMP")        # 24-bit
 
 
 def save_raw(levels_img, path):
@@ -117,23 +162,31 @@ def save_raw(levels_img, path):
 #  Self test
 # ---------------------------------------------------------------------------
 def selftest():
-    src = Image.linear_gradient("L").resize((640, 480)).convert("RGB")
+    small = Image.new("RGB", (161, 161))
+    for x in range(161):
+        for y in range(161):
+            small.putpixel((x, y), ((x + y) % 256,) * 3)
+    big = Image.linear_gradient("L").resize((640, 480)).convert("RGB")
+
     for name, size in PANEL_BY_INCH.items():
-        for dither in (False, True):
-            lv, disp = convert(src, size, dither=dither)
-            assert lv.size == size, (name, lv.size)
-            uniq = set(lv.tobytes())
-            assert uniq <= set(range(LEVELS)), "level out of range"
-            raw = pack_4bpp(lv)
-            assert len(raw) == size[0] * size[1] // 2, "raw size"
-            print(f"  {name:>4}\"  dither={dither!s:5}  {size[0]}x{size[1]}  "
-                  f"levels={len(uniq):2}  raw={len(raw):,} B")
+        for mode in ("fit", "fill", "width", "height", "stretch", "manual"):
+            lv, disp, meta = convert(small if mode in ("fit", "width") else big,
+                                     size, mode=mode, dither=(mode != "manual"))
+            assert lv.size == size, (name, mode, lv.size)
+            assert set(lv.tobytes()) <= set(range(LEVELS)), "level out of range"
+            assert len(pack_4bpp(lv)) == size[0] * size[1] // 2, "raw size"
+    # the 161x161 bug: fit/width must now enlarge to fill at least one axis
+    lv, disp, meta = convert(small, (1072, 1448), mode="width")
+    assert meta["scale"] > 6.0, f"small image not upscaled (scale={meta['scale']})"
+    print(f"  161x161 width-fill scale = {meta['scale']:.2f} (fills 1072 px)")
+    # manual offset/scale honoured
+    lv, disp, meta = convert(big, (1072, 1448), mode="manual", scale=2.0, off=(10, 20))
+    assert abs(meta["scale"] - 2.0) < 1e-6 and meta["off"] == (10, 20), "manual not honoured"
     with tempfile.TemporaryDirectory() as d:
-        lv, disp = convert(src, PANEL_BY_INCH["6"])
+        lv, disp, meta = convert(big, PANEL_BY_INCH["6"], mode="fit")
         p = os.path.join(d, "t.bmp"); save_bmp(disp, p)
-        with Image.open(p) as back:            # close before the temp dir is removed
+        with Image.open(p) as back:
             assert back.size == PANEL_BY_INCH["6"] and back.mode == "RGB", "bmp roundtrip"
-            print(f"  bmp roundtrip ok ({os.path.getsize(p):,} B, mode {back.mode})")
     print("selftest OK")
 
 
@@ -147,11 +200,14 @@ def run_cli(a):
             sys.exit("--panel must be 6 / 7.8 / 10.3, or give --size WxH")
         size = tuple(int(v) for v in a.size.lower().split("x"))
     img = Image.open(a.cli)
-    lv, disp = convert(img, size, rotate=a.rotate, fit=a.fit, pad_white=not a.pad_black,
-                       brightness=a.brightness, contrast=a.contrast, gamma=a.gamma,
-                       dither=not a.no_dither, invert=a.invert)
+    off = (a.offx, a.offy) if (a.offx or a.offy) else None
+    scale = (a.scale / 100.0) if a.scale else None
+    lv, disp, meta = convert(img, size, rotate=a.rotate, mode=a.mode, scale=scale, off=off,
+                             pad_white=not a.pad_black, brightness=a.brightness,
+                             contrast=a.contrast, gamma=a.gamma, dither=not a.no_dither,
+                             invert=a.invert)
     if a.out:
-        save_bmp(disp, a.out); print(f"wrote {a.out}  ({size[0]}x{size[1]} 24-bit BMP)")
+        save_bmp(disp, a.out); print(f"wrote {a.out}  ({size[0]}x{size[1]} 24-bit BMP, scale={meta['scale']})")
     if a.raw:
         save_raw(lv, a.raw);   print(f"wrote {a.raw}  ({size[0]*size[1]//2:,} B, 4bpp)")
 
@@ -166,33 +222,30 @@ def run_gui(initial=None):
 
     root = tk.Tk()
     root.title("EPD Image Tool - 16계조 변환")
-    root.geometry("1180x720")
-    root.minsize(900, 560)
+    root.geometry("1180x740")
+    root.minsize(960, 580)
 
-    state = {"src": None, "src_path": None, "levels": None, "display": None, "job": None}
+    st = {"src": None, "src_path": None, "levels": None, "display": None,
+          "job": None, "out_scale": 1.0, "out_pos": (0, 0),
+          "man_scale": 1.0, "man_off": None, "drag": None, "dragging": False,
+          "sync": False}
 
-    # ---- controls (left) --------------------------------------------------
-    side = ttk.Frame(root, padding=10)
-    side.pack(side="left", fill="y")
+    side = ttk.Frame(root, padding=10); side.pack(side="left", fill="y")
 
     def row(label):
         f = ttk.Frame(side); f.pack(fill="x", pady=3)
-        ttk.Label(f, text=label, width=10).pack(side="left")
-        return f
+        ttk.Label(f, text=label, width=9).pack(side="left"); return f
 
-    ttk.Button(side, text="이미지 열기…", command=lambda: open_image()).pack(fill="x", pady=(0, 8))
-    src_lbl = ttk.Label(side, text="(파일 없음)", foreground="#666", wraplength=230)
-    src_lbl.pack(fill="x")
-
+    ttk.Button(side, text="이미지 열기…", command=lambda: open_image()).pack(fill="x", pady=(0, 6))
+    src_lbl = ttk.Label(side, text="(파일 없음)", foreground="#666", wraplength=240); src_lbl.pack(fill="x")
     ttk.Separator(side).pack(fill="x", pady=8)
 
     panel_var = tk.StringVar(value=list(PANELS)[0])
     f = row("패널")
-    panel_cb = ttk.Combobox(f, textvariable=panel_var, values=list(PANELS), state="readonly", width=26)
-    panel_cb.pack(side="left", fill="x", expand=True)
+    ttk.Combobox(f, textvariable=panel_var, values=list(PANELS), state="readonly", width=26).pack(side="left", fill="x", expand=True)
 
     f = row("크기")
-    w_var = tk.StringVar(value="1072"); h_var = tk.StringVar(value="1448")
+    w_var, h_var = tk.StringVar(value="1072"), tk.StringVar(value="1448")
     w_ent = ttk.Entry(f, textvariable=w_var, width=7); w_ent.pack(side="left")
     ttk.Label(f, text=" x ").pack(side="left")
     h_ent = ttk.Entry(f, textvariable=h_var, width=7); h_ent.pack(side="left")
@@ -203,74 +256,75 @@ def run_gui(initial=None):
     ttk.Label(f, text="° 시계방향").pack(side="left")
 
     f = row("맞춤")
-    fit_var = tk.StringVar(value=FIT_MODES[0])
-    ttk.Combobox(f, textvariable=fit_var, values=FIT_MODES, state="readonly", width=16).pack(side="left")
+    mode_var = tk.StringVar(value=list(MODES)[0])
+    ttk.Combobox(f, textvariable=mode_var, values=list(MODES), state="readonly", width=16).pack(side="left")
     pad_var = tk.StringVar(value="흰색")
     ttk.Combobox(f, textvariable=pad_var, values=("흰색", "검정"), state="readonly", width=5).pack(side="left", padx=(6, 0))
 
+    f = row("줌 %")
+    zoom_var = tk.DoubleVar(value=100)
+    zoom_scale = ttk.Scale(f, from_=10, to=400, variable=zoom_var, orient="horizontal")
+    zoom_scale.pack(side="left", fill="x", expand=True)
+    zoom_lbl = ttk.Label(f, width=5); zoom_lbl.pack(side="left")
+    ttk.Label(side, text="결과 미리보기를 드래그해 위치 이동 · 더블클릭=가운데",
+              foreground="#777", wraplength=240).pack(fill="x", pady=(0, 2))
+
     def slider(label, var, lo, hi, res=1):
         f = row(label)
-        s = ttk.Scale(f, from_=lo, to=hi, variable=var, orient="horizontal")
-        s.pack(side="left", fill="x", expand=True)
+        ttk.Scale(f, from_=lo, to=hi, variable=var, orient="horizontal").pack(side="left", fill="x", expand=True)
         v = ttk.Label(f, width=5); v.pack(side="left")
         def upd(*_): v.config(text=f"{var.get():.2f}" if res != 1 else f"{int(var.get())}")
         var.trace_add("write", upd); upd()
-        return s
 
     bri_var = tk.DoubleVar(value=0);   slider("밝기", bri_var, -100, 100)
     con_var = tk.DoubleVar(value=0);   slider("대비", con_var, -100, 100)
     gam_var = tk.DoubleVar(value=1.0); slider("감마", gam_var, 0.3, 3.0, res=0.01)
 
-    dith_var = tk.BooleanVar(value=True)
-    inv_var = tk.BooleanVar(value=False)
+    dith_var = tk.BooleanVar(value=True); inv_var = tk.BooleanVar(value=False)
     f = ttk.Frame(side); f.pack(fill="x", pady=6)
     ttk.Checkbutton(f, text="디더링 (Floyd-Steinberg)", variable=dith_var).pack(anchor="w")
     ttk.Checkbutton(f, text="반전", variable=inv_var).pack(anchor="w")
-
     ttk.Button(side, text="초기화", command=lambda: reset_adjust()).pack(fill="x", pady=(2, 8))
 
     ttk.Separator(side).pack(fill="x", pady=8)
     ttk.Button(side, text="BMP 저장 (24-bit, 툴 입력용)…", command=lambda: save("bmp")).pack(fill="x", pady=2)
     ttk.Button(side, text="RAW 저장 (4bpp, 펌웨어 포맷)…", command=lambda: save("raw")).pack(fill="x", pady=2)
+    info = ttk.Label(side, text="", foreground="#444", justify="left", wraplength=244); info.pack(fill="x", pady=(12, 0))
 
-    info = ttk.Label(side, text="", foreground="#444", justify="left", wraplength=240)
-    info.pack(fill="x", pady=(12, 0))
-
-    # ---- previews (right) -------------------------------------------------
-    right = ttk.Frame(root, padding=(0, 10, 10, 10))
-    right.pack(side="right", fill="both", expand=True)
+    right = ttk.Frame(root, padding=(0, 10, 10, 10)); right.pack(side="right", fill="both", expand=True)
     hdr = ttk.Frame(right); hdr.pack(fill="x")
     ttk.Label(hdr, text="원본").pack(side="left", expand=True)
-    ttk.Label(hdr, text="결과 (16계조, 실제 출력)").pack(side="left", expand=True)
-    cv_frame = ttk.Frame(right); cv_frame.pack(fill="both", expand=True)
-    cv_src = tk.Canvas(cv_frame, bg="#dcdcdc", highlightthickness=0)
-    cv_out = tk.Canvas(cv_frame, bg="#dcdcdc", highlightthickness=0)
+    ttk.Label(hdr, text="결과 (16계조, 실제 출력 - 드래그 이동)").pack(side="left", expand=True)
+    cvf = ttk.Frame(right); cvf.pack(fill="both", expand=True)
+    cv_src = tk.Canvas(cvf, bg="#dcdcdc", highlightthickness=0)
+    cv_out = tk.Canvas(cvf, bg="#dcdcdc", highlightthickness=0)
     cv_src.pack(side="left", fill="both", expand=True, padx=(0, 4))
     cv_out.pack(side="left", fill="both", expand=True, padx=(4, 0))
-    status = ttk.Label(right, text="이미지를 열어 시작하세요.", anchor="w")
-    status.pack(fill="x", pady=(6, 0))
+    status = ttk.Label(right, text="이미지를 열어 시작하세요.", anchor="w"); status.pack(fill="x", pady=(6, 0))
 
     photos = {}
 
     def draw(canvas, img, key):
         canvas.delete("all")
         if img is None:
-            return
+            return 1.0, (0, 0)
         cw, ch = max(canvas.winfo_width(), 50), max(canvas.winfo_height(), 50)
         scale = min(cw / img.width, ch / img.height, 1.0)
-        shown = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.LANCZOS)
+        shown = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.NEAREST if key == "out" else Image.LANCZOS)
         photos[key] = ImageTk.PhotoImage(shown)
-        canvas.create_image(cw // 2, ch // 2, image=photos[key], anchor="center")
+        x0, y0 = (cw - shown.width) // 2, (ch - shown.height) // 2
+        canvas.create_image(x0, y0, image=photos[key], anchor="nw")
+        return scale, (x0, y0)
 
-    # ---- logic --------------------------------------------------------------
+    def cur_mode():
+        return MODES[mode_var.get()]
+
     def target_size():
         try:
             w, h = int(w_var.get()), int(h_var.get())
         except ValueError:
             return None
-        if w < 2 or h < 1:
-            return None
-        return (w - (w % 2), h)                         # keep width even
+        return (w - (w % 2), h) if (w >= 2 and h >= 1) else None
 
     def on_panel(*_):
         size = PANELS[panel_var.get()]
@@ -282,72 +336,162 @@ def run_gui(initial=None):
         schedule()
 
     def open_image(path=None):
-        p = path or filedialog.askopenfilename(filetypes=[("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"), ("모든 파일", "*.*")])
+        p = path or filedialog.askopenfilename(
+            filetypes=[("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"), ("모든 파일", "*.*")])
         if not p:
             return
         try:
             img = Image.open(p); img.load()
         except Exception as e:
             messagebox.showerror("열기 실패", str(e)); return
-        state["src"], state["src_path"] = img, p
+        st["src"], st["src_path"] = img, p
+        st["man_off"] = None
         src_lbl.config(text=f"{os.path.basename(p)}\n{img.width} x {img.height}  {img.mode}")
         draw(cv_src, img.convert("RGB"), "src")
         schedule()
 
     def reset_adjust():
-        bri_var.set(0); con_var.set(0); gam_var.set(1.0)
+        st["sync"] = True
+        bri_var.set(0); con_var.set(0); gam_var.set(1.0); zoom_var.set(100)
         dith_var.set(True); inv_var.set(False); rot_var.set("0")
-        fit_var.set(FIT_MODES[0]); pad_var.set("흰색")
+        mode_var.set(list(MODES)[0]); pad_var.set("흰색")
+        st["man_off"] = None; st["sync"] = False
         schedule()
 
-    def schedule(*_):
-        if state["job"]:
-            root.after_cancel(state["job"])
-        state["job"] = root.after(120, render)          # debounce slider drags
+    def go_manual_from_current():
+        """Seed manual scale/offset from whatever is on screen right now."""
+        if st["src"] is None:
+            return
+        st["sync"] = True
+        mode_var.set("수동 (줌/드래그)")
+        st["sync"] = False
+
+    def on_zoom(*_):
+        if st["sync"]:
+            return
+        # user turned the zoom knob -> manual, keep current offset
+        if cur_mode() != "manual":
+            go_manual_from_current()
+        st["man_scale"] = zoom_var.get() / 100.0
+        schedule()
 
     def render():
-        state["job"] = None
-        if state["src"] is None:
+        st["job"] = None
+        if st["src"] is None:
             return
         size = target_size()
         if size is None:
-            status.config(text="크기가 올바르지 않습니다 (가로는 짝수).")
-            return
-        fit = {"fit (여백)": "fit", "fill (잘라냄)": "fill", "stretch (늘림)": "stretch"}[fit_var.get()]
+            status.config(text="크기가 올바르지 않습니다 (가로는 짝수)."); return
+        mode = cur_mode()
+        scale = st["man_scale"] if mode == "manual" else None
+        off = st["man_off"] if mode == "manual" else None
+        use_dither = dith_var.get() and not st["dragging"]
         try:
-            lv, disp = convert(state["src"], size, rotate=int(rot_var.get()), fit=fit,
-                               pad_white=(pad_var.get() == "흰색"),
-                               brightness=bri_var.get(), contrast=con_var.get(),
-                               gamma=gam_var.get(), dither=dith_var.get(), invert=inv_var.get())
+            lv, disp, meta = convert(st["src"], size, rotate=int(rot_var.get()), mode=mode,
+                                     scale=scale, off=off, pad_white=(pad_var.get() == "흰색"),
+                                     brightness=bri_var.get(), contrast=con_var.get(),
+                                     gamma=gam_var.get(), dither=use_dither, invert=inv_var.get())
         except Exception as e:
             status.config(text=f"변환 오류: {e}"); return
-        state["levels"], state["display"] = lv, disp
-        draw(cv_out, disp, "out")
+        st["levels"], st["display"] = lv, disp
+        st["out_scale"], st["out_pos"] = draw(cv_out, disp, "out")
+        # reflect the resolved scale back onto the zoom knob (without recursing)
+        if meta["scale"]:
+            st["sync"] = True; zoom_var.set(round(meta["scale"] * 100)); st["sync"] = False
+        if mode == "manual" and meta["off"]:
+            st["man_off"] = meta["off"]
         used = len(set(lv.tobytes()))
-        info.config(text=f"출력 {size[0]} x {size[1]}\n16계조 중 사용 {used}단계\n"
+        info.config(text=f"출력 {size[0]} x {size[1]}   배율 {('%.0f%%' % (meta['scale']*100)) if meta['scale'] else '늘림'}\n"
+                         f"16계조 중 사용 {used}단계\n"
                          f"BMP ≈ {size[0]*size[1]*3/1024:,.0f} KB   RAW = {size[0]*size[1]//2/1024:,.0f} KB")
-        status.config(text=f"미리보기 갱신됨 - {size[0]}x{size[1]}, {'디더링' if dith_var.get() else '단순 양자화'}")
+        status.config(text=f"미리보기 - {mode}, {'디더링' if dith_var.get() else '단순 양자화'}")
+
+    def schedule(*_):
+        if st["sync"]:
+            return
+        if st["job"]:
+            root.after_cancel(st["job"])
+        st["job"] = root.after(100, render)
+
+    # ---- drag on the result canvas ---------------------------------------
+    def drag_start(ev):
+        if st["src"] is None:
+            return
+        if cur_mode() != "manual":
+            go_manual_from_current()
+        if st["man_off"] is None:                      # seed offset from current layout
+            size = target_size() or (1, 1)
+            iw, ih = ImageOps.exif_transpose(st["src"]).size
+            if int(rot_var.get()) in (90, 270):
+                iw, ih = ih, iw
+            _, ox, oy = resolve_layout(iw, ih, size, "manual", st["man_scale"], None)
+            st["man_off"] = (ox, oy)
+        st["drag"] = (ev.x, ev.y, st["man_off"])
+        st["dragging"] = True
+
+    def drag_move(ev):
+        if not st["drag"]:
+            return
+        x0, y0, (ox, oy) = st["drag"]
+        sc = st["out_scale"] or 1.0
+        st["man_off"] = (round(ox + (ev.x - x0) / sc), round(oy + (ev.y - y0) / sc))
+        schedule()
+
+    def drag_end(ev):
+        st["drag"] = None
+        if st["dragging"]:
+            st["dragging"] = False
+            schedule()                                 # final render with dithering
+
+    def center_image(ev=None):
+        if st["src"] is None:
+            return
+        if cur_mode() != "manual":
+            go_manual_from_current()
+        size = target_size() or (1, 1)
+        iw, ih = ImageOps.exif_transpose(st["src"]).size
+        if int(rot_var.get()) in (90, 270):
+            iw, ih = ih, iw
+        _, ox, oy = resolve_layout(iw, ih, size, "manual", st["man_scale"], None)
+        st["man_off"] = (ox, oy); schedule()
+
+    cv_out.bind("<Button-1>", drag_start)
+    cv_out.bind("<B1-Motion>", drag_move)
+    cv_out.bind("<ButtonRelease-1>", drag_end)
+    cv_out.bind("<Double-Button-1>", center_image)
 
     def save(kind):
-        if state["display"] is None:
+        if st["display"] is None:
             messagebox.showinfo("저장", "먼저 이미지를 열어주세요."); return
-        base = os.path.splitext(os.path.basename(state["src_path"] or "image"))[0]
-        w, h = state["display"].size
+        base = os.path.splitext(os.path.basename(st["src_path"] or "image"))[0]
+        w, h = st["display"].size
         if kind == "bmp":
             p = filedialog.asksaveasfilename(defaultextension=".bmp", initialfile=f"{base}_{w}x{h}.bmp",
                                              filetypes=[("24-bit BMP", "*.bmp")])
-            if p: save_bmp(state["display"], p); status.config(text=f"저장됨: {p}")
+            if p: save_bmp(st["display"], p); status.config(text=f"저장됨: {p}")
         else:
             p = filedialog.asksaveasfilename(defaultextension=".bin", initialfile=f"{base}_{w}x{h}_4bpp.bin",
                                              filetypes=[("4bpp raw", "*.bin")])
-            if p: save_raw(state["levels"], p); status.config(text=f"저장됨: {p}  ({w*h//2:,} B)")
+            if p: save_raw(st["levels"], p); status.config(text=f"저장됨: {p}  ({w*h//2:,} B)")
 
-    # ---- wiring -------------------------------------------------------------
+    def on_mode(*_):
+        if st["sync"]:
+            return
+        if cur_mode() != "manual":
+            st["man_off"] = None                       # presets recentre
+        schedule()
+
+    def on_zoom_lbl(*_):
+        zoom_lbl.config(text=f"{int(zoom_var.get())}%")
+
     panel_var.trace_add("write", on_panel)
-    for v in (w_var, h_var, rot_var, fit_var, pad_var, bri_var, con_var, gam_var, dith_var, inv_var):
+    mode_var.trace_add("write", on_mode)
+    zoom_var.trace_add("write", on_zoom)
+    zoom_var.trace_add("write", on_zoom_lbl); on_zoom_lbl()
+    for v in (w_var, h_var, rot_var, pad_var, bri_var, con_var, gam_var, dith_var, inv_var):
         v.trace_add("write", schedule)
-    cv_src.bind("<Configure>", lambda e: draw(cv_src, state["src"].convert("RGB") if state["src"] else None, "src"))
-    cv_out.bind("<Configure>", lambda e: draw(cv_out, state["display"], "out"))
+    cv_src.bind("<Configure>", lambda e: draw(cv_src, st["src"].convert("RGB") if st["src"] else None, "src"))
+    cv_out.bind("<Configure>", lambda e: schedule())
     on_panel()
     if initial:
         root.after(200, lambda: open_image(initial))
@@ -365,7 +509,10 @@ if __name__ == "__main__":
     ap.add_argument("--out", help="output .bmp")
     ap.add_argument("--raw", help="output .bin (4bpp packed)")
     ap.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270))
-    ap.add_argument("--fit", default="fit", choices=("fit", "fill", "stretch"))
+    ap.add_argument("--mode", default="fit", choices=("fit", "fill", "width", "height", "stretch", "manual"))
+    ap.add_argument("--scale", type=float, default=0, help="manual zoom percent (mode=manual)")
+    ap.add_argument("--offx", type=int, default=0, help="manual x offset in output pixels")
+    ap.add_argument("--offy", type=int, default=0, help="manual y offset in output pixels")
     ap.add_argument("--pad-black", action="store_true")
     ap.add_argument("--brightness", type=float, default=0)
     ap.add_argument("--contrast", type=float, default=0)
