@@ -159,7 +159,7 @@ def run_cli(a):
 # ---------------------------------------------------------------------------
 #  GUI
 # ---------------------------------------------------------------------------
-def run_gui():
+def run_gui(initial=None):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
     from PIL import ImageTk
@@ -281,8 +281,8 @@ def run_gui():
             w_var.set(str(size[0])); h_var.set(str(size[1]))
         schedule()
 
-    def open_image():
-        p = filedialog.askopenfilename(filetypes=[("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"), ("모든 파일", "*.*")])
+    def open_image(path=None):
+        p = path or filedialog.askopenfilename(filetypes=[("이미지", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"), ("모든 파일", "*.*")])
         if not p:
             return
         try:
@@ -349,6 +349,8 @@ def run_gui():
     cv_src.bind("<Configure>", lambda e: draw(cv_src, state["src"].convert("RGB") if state["src"] else None, "src"))
     cv_out.bind("<Configure>", lambda e: draw(cv_out, state["display"], "out"))
     on_panel()
+    if initial:
+        root.after(200, lambda: open_image(initial))
     root.mainloop()
 
 
@@ -357,6 +359,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cli", metavar="INPUT", help="convert without the GUI")
+    ap.add_argument("--open", metavar="INPUT", help="start the GUI with this image loaded")
     ap.add_argument("--panel", default="6", help="6 | 7.8 | 10.3")
     ap.add_argument("--size", help="custom WxH (overrides --panel)")
     ap.add_argument("--out", help="output .bmp")
@@ -375,4 +378,4 @@ if __name__ == "__main__":
     elif a.cli:
         run_cli(a)
     else:
-        run_gui()
+        run_gui(a.open)
