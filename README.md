@@ -60,3 +60,18 @@ python epd_image_tool.py --selftest        # 프리셋별 크기·레벨·raw �
 회전 → 맞춤(fit/fill/stretch) → 그레이 → 밝기·대비·감마 → 16계조 양자화(Floyd-Steinberg 디더링 선택) → 반전(선택)
 
 디더링을 켜면 e-paper에서 계조 띠(banding)가 눈에 띄게 줄어듭니다. 선·텍스트 위주 이미지는 끄는 편이 깔끔합니다.
+
+## 보드로 전송 (epd_send.py)
+
+EPDdemo 는 6"(1448×1072) 전용이라 7.8"/10.3" 이미지는 못 보냅니다.
+크기 무관 송신기를 함께 둡니다 — 레거시와 같은 10바이트 프로토콜.
+
+```bash
+python epd_send.py image.bmp --ip 192.168.45.154          # BMP는 패널 크기여야 함
+python epd_send.py image.bin --ip 192.168.45.154 --w 1872 --h 1404
+python epd_send.py image.bmp --ip 192.168.45.154 --no-clear
+python epd_send.py --selftest
+```
+
+전송 순서: fill(흰색) → display → load(이미지) → display.
+보드 IP 는 부팅 로그의 `connected, IP ...` 또는 시리얼 CLI 의 `wifi` 명령으로 확인.
