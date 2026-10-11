@@ -377,6 +377,32 @@ def run_gui(initial=None):
     cv_out.pack(side="left", fill="both", expand=True, padx=(4, 0))
     status = ttk.Label(right, text="이미지를 열어 시작하세요.", anchor="w"); status.pack(fill="x", pady=(6, 0))
 
+    # ---- debug log panel (also echoed to stdout when run from a console) ---
+    from tkinter import scrolledtext
+    logf = ttk.Frame(right); logf.pack(fill="x", pady=(6, 0))
+    ttk.Label(logf, text="로그 (전송/디버그)").pack(side="left")
+    ttk.Button(logf, text="지우기", width=7,
+               command=lambda: (logbox.configure(state="normal"),
+                                logbox.delete("1.0", "end"),
+                                logbox.configure(state="disabled"))).pack(side="right")
+    logbox = scrolledtext.ScrolledText(right, height=8, state="disabled",
+                                       font=("Consolas", 9), wrap="none")
+    logbox.pack(fill="both", expand=False)
+
+    import time as _time
+    def log(msg, color=None):
+        line = _time.strftime("%H:%M:%S ") + msg
+        try:
+            print(line, flush=True)                      # console when launched from cmd
+        except Exception:
+            pass
+        logbox.configure(state="normal")
+        logbox.insert("end", line + "\n")
+        logbox.see("end")
+        logbox.configure(state="disabled")
+        if color:
+            send_lbl.config(text=msg, foreground=color)
+
     photos = {}
 
     def draw(canvas, img, key):
@@ -604,32 +630,45 @@ def run_gui(initial=None):
             if p: save_raw(st["levels"], p); status.config(text=f"저장됨: {p}  ({w*h//2:,} B)")
 
     # ---- send to the board (background thread) ---------------------------
-    def send_post(msg, color="#444"):
-        send_lbl.config(text=msg, foreground=color)
-
     def send_done():
         send_btn.config(state="normal", text="▶ 보드로 전송")
 
     def send_worker(ip, w, h, payload, clear):
+        t0 = _time.time()
+        def L(msg, color=None):                          # marshal log to UI thread
+            root.after(0, log, msg, color)
         try:
-            root.after(0, send_post, f"접속 중 {ip}:{TCP_PORT} …")
-            with socket.create_connection((ip, TCP_PORT), timeout=8) as s:
-                s.settimeout(20)
+            L(f"접속 중  {ip}:{TCP_PORT}  (connect timeout 8s)")
+            t = _time.time()
+            s = socket.create_connection((ip, TCP_PORT), timeout=8)
+            L(f"  연결 성공 ({(_time.time()-t)*1000:.0f} ms)")
+            s.settimeout(30)
+            with s:
                 if clear:
                     s.sendall(_hdr(1, 0x0F, 0, 0, w, h))
                     s.sendall(_hdr(4, 0, 0, 0, w, h))
-                    root.after(0, send_post, "흰색으로 지움 …")
+                    L("  cmd1 fill(흰색) + cmd4 display 전송")
                 s.sendall(_hdr(2, 0x0F, 0, 0, w, h))
-                total, sent, CH = len(payload), 0, 8192
+                L(f"  cmd2 load {w}x{h}, payload {len(payload):,} B 전송 시작")
+                total, sent, CH = len(payload), 0, 65536
+                ts = _time.time()
                 while sent < total:
-                    s.sendall(payload[sent:sent + CH]); sent += CH
-                    sent = min(sent, total)
-                    if sent % (CH * 32) == 0 or sent == total:
-                        root.after(0, send_post, f"전송 {sent*100//total}%  ({sent:,}/{total:,} B)")
+                    s.sendall(payload[sent:sent + CH]); sent += min(CH, total - sent)
+                    if sent % (CH * 4) == 0 or sent == total:
+                        L(f"    전송 {sent*100//total:3d}%  ({sent:,}/{total:,} B)")
+                dt = _time.time() - ts
+                mbps = total * 8 / dt / 1e6 if dt > 0 else 0
+                L(f"  payload 완료: {dt:.2f}s, {mbps:.1f} Mbps")
                 s.sendall(_hdr(4, 0, 0, 0, w, h))
-            root.after(0, send_post, "완료 ✓ 화면 갱신됨", "#1a7a1a")
+                L("  cmd4 display 전송")
+            L(f"완료 ✓ 전체 {_time.time()-t0:.2f}s", "#1a7a1a")
+        except socket.timeout:
+            L("전송 실패: TIMEOUT - 응답 없음. IP/같은 네트워크/방화벽 확인", "#c0392b")
+        except OSError as e:
+            L(f"전송 실패: {type(e).__name__} {e} (errno={getattr(e,'errno',None)})", "#c0392b")
+            L("  → IP가 맞는지(CLI 'wifi'), PC가 같은 WiFi인지, 방화벽 확인", "#c0392b")
         except Exception as e:                          # noqa
-            root.after(0, send_post, f"전송 실패: {e}", "#c0392b")
+            L(f"전송 실패: {type(e).__name__}: {e}", "#c0392b")
         finally:
             root.after(0, send_done)
 
@@ -643,7 +682,7 @@ def run_gui(initial=None):
         w, h = st["levels"].size
         payload = pack_4bpp(st["levels"])
         send_btn.config(state="disabled", text="전송 중…")
-        send_post(f"{w}x{h}, {len(payload):,} B 전송 시작…")
+        log(f"── 전송 시작  {w}x{h}, {len(payload):,} B, clear={clr_var.get()} ──")
         threading.Thread(target=send_worker, args=(ip, w, h, payload, clr_var.get()),
                          daemon=True).start()
 
