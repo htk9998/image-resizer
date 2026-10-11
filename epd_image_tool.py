@@ -49,12 +49,12 @@ def _hdr(cmd, color, x, y, w, h):
 #  Panel presets - bitmap W x H as the panel vendors state them
 # ---------------------------------------------------------------------------
 PANELS = {
-    '6"   (OPM060E9)   1072 x 1448': (1072, 1448),
+    '6"   (OPM060E9)   1448 x 1072': (1448, 1072),
     '7.8" (ED078KC2)   1872 x 1404': (1872, 1404),
     '10.3"(ED103TC2)   1872 x 1404': (1872, 1404),
     "사용자 정의": None,
 }
-PANEL_BY_INCH = {"6": (1072, 1448), "7.8": (1872, 1404), "10.3": (1872, 1404)}
+PANEL_BY_INCH = {"6": (1448, 1072), "7.8": (1872, 1404), "10.3": (1872, 1404)}
 
 MODES = {
     "fit (여백)":       "fit",
@@ -305,7 +305,7 @@ def run_gui(initial=None):
     ttk.Combobox(f, textvariable=panel_var, values=list(PANELS), state="readonly", width=26).pack(side="left", fill="x", expand=True)
 
     f = row("크기")
-    w_var, h_var = tk.StringVar(value="1072"), tk.StringVar(value="1448")
+    w_var, h_var = tk.StringVar(value="1448"), tk.StringVar(value="1072")
     w_ent = ttk.Entry(f, textvariable=w_var, width=7); w_ent.pack(side="left")
     ttk.Label(f, text=" x ").pack(side="left")
     h_ent = ttk.Entry(f, textvariable=h_var, width=7); h_ent.pack(side="left")
