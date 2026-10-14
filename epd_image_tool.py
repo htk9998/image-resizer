@@ -642,12 +642,57 @@ def run_gui(initial=None):
             t = _time.time()
             s = socket.create_connection((ip, TCP_PORT), timeout=8)
             L(f"  연결 성공 ({(_time.time()-t)*1000:.0f} ms)")
-            s.settimeout(30)
+
+            def rx(n):                                   # read exactly n bytes
+                buf = b""
+                while len(buf) < n:
+                    c = s.recv(n - len(buf))
+                    if not c:
+                        raise ConnectionError("연결 끊김(응답 수신 중)")
+                    buf += c
+                return buf
+
+            def read_ack(tag):                           # 6B 완료 ACK
+                a = rx(6)
+                if len(a) == 6 and a[0] == 0x01:
+                    stat = {0: "OK", 1: "TIMEOUT", 2: "ERR"}.get(a[1], str(a[1]))
+                    ms = int.from_bytes(a[2:6], "little")
+                    L(f"  ← {tag} 완료 ACK [{stat}, {ms} ms]",
+                      "#1a7a1a" if a[1] == 0 else "#c0392b")
+                else:
+                    L(f"  ← {tag}: 예상외 응답")
+
             with s:
+                # --- 확장 모드 프로브: cmd33 STATUS (없으면 레거시로 폴백) ---
+                extended = False
+                s.settimeout(2.5)
+                try:
+                    s.sendall(_hdr(33, 0, 0, 0, 0, 0))
+                    b = rx(19)
+                    if b[0] == 0x02:
+                        extended = True
+                        pw, ph = b[2] | b[3] << 8, b[4] | b[5] << 8
+                        up = int.from_bytes(b[6:10], "little")
+                        rssi = int.from_bytes(b[10:12], "little", signed=True)
+                        vbat = int.from_bytes(b[12:14], "little")
+                        lastr = {0: "OK", 1: "TIMEOUT", 2: "ERR", 0xFF: "-"}.get(b[14], b[14])
+                        lastms = int.from_bytes(b[15:19], "little")
+                        rssi_s = f"{rssi} dBm" if rssi != 0x7FFF else "—"
+                        L(f"  ✓ 확장모드 · 패널 {pw}x{ph} · uptime {up}s · "
+                          f"RSSI {rssi_s} · VBAT {vbat} mV · 직전표시 {lastr}/{lastms}ms")
+                    else:
+                        L(f"  확장 응답 형식 예상외(type={b[0]:#x}) — 블라인드 전송")
+                except socket.timeout:
+                    L("  확장 미지원(레거시 펌웨어) — 블라인드 전송")
+                s.settimeout(30)
+
                 if clear:
                     s.sendall(_hdr(1, 0x0F, 0, 0, w, h))
                     s.sendall(_hdr(4, 0, 0, 0, w, h))
                     L("  cmd1 fill(흰색) + cmd4 display 전송")
+                    if extended:
+                        read_ack("지움")
+
                 s.sendall(_hdr(2, 0x0F, 0, 0, w, h))
                 L(f"  cmd2 load {w}x{h}, payload {len(payload):,} B 전송 시작")
                 total, sent, CH = len(payload), 0, 65536
@@ -659,9 +704,14 @@ def run_gui(initial=None):
                 dt = _time.time() - ts
                 mbps = total * 8 / dt / 1e6 if dt > 0 else 0
                 L(f"  payload 완료: {dt:.2f}s, {mbps:.1f} Mbps")
+
                 s.sendall(_hdr(4, 0, 0, 0, w, h))
                 L("  cmd4 display 전송")
-            L(f"완료 ✓ 전체 {_time.time()-t0:.2f}s", "#1a7a1a")
+                if extended:
+                    read_ack("표시")
+                    L(f"완료 ✓ 전체 {_time.time()-t0:.2f}s", "#1a7a1a")
+                else:
+                    L(f"완료 ✓ (블라인드) 전체 {_time.time()-t0:.2f}s", "#1a7a1a")
         except socket.timeout:
             L("전송 실패: TIMEOUT - 응답 없음. IP/같은 네트워크/방화벽 확인", "#c0392b")
         except OSError as e:
