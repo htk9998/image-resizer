@@ -652,34 +652,47 @@ def run_gui(initial=None):
                     buf += c
                 return buf
 
-            def read_ack(tag):                           # 6B 완료 ACK
+            def read_display(tag):                       # 6B DISPLAY 결과 (type 0x01)
                 a = rx(6)
                 if len(a) == 6 and a[0] == 0x01:
-                    stat = {0: "OK", 1: "TIMEOUT", 2: "ERR"}.get(a[1], str(a[1]))
+                    st = {0: "OK", 1: "TIMEOUT", 2: "CTRL_ERR"}.get(a[1], str(a[1]))
                     ms = int.from_bytes(a[2:6], "little")
-                    L(f"  ← {tag} 완료 ACK [{stat}, {ms} ms]",
+                    L(f"  ← {tag} 표시결과 [{st}, {ms} ms]",
                       "#1a7a1a" if a[1] == 0 else "#c0392b")
                 else:
-                    L(f"  ← {tag}: 예상외 응답")
+                    L(f"  ← {tag}: 예상외 응답 type={a[0]:#x}")
+
+            def read_load():                             # 10B LOAD 결과 (type 0x02)
+                a = rx(10)
+                if len(a) == 10 and a[0] == 0x02:
+                    st = {0: "OK", 1: "SHORT", 2: "OVERRUN", 3: "AREA_INVALID",
+                          4: "CTRL_ERR"}.get(a[1], str(a[1]))
+                    rcv = int.from_bytes(a[2:6], "little")
+                    exp = int.from_bytes(a[6:10], "little")
+                    L(f"  ← 수신결과 [{st}, {rcv:,}/{exp:,} B]",
+                      "#1a7a1a" if a[1] == 0 else "#c0392b")
+                else:
+                    L(f"  ← 수신결과: 예상외 응답 type={a[0]:#x}")
 
             with s:
-                # --- 확장 모드 프로브: cmd33 STATUS (없으면 레거시로 폴백) ---
+                # --- 확장 모드 프로브: cmd 0x21 STATUS? (없으면 레거시로 폴백) ---
                 extended = False
                 s.settimeout(2.5)
                 try:
-                    s.sendall(_hdr(33, 0, 0, 0, 0, 0))
-                    b = rx(19)
-                    if b[0] == 0x02:
+                    s.sendall(_hdr(0x21, 0, 0, 0, 0, 0))
+                    b = rx(23)                           # STATUS (type 0x03)
+                    if b[0] == 0x03:
                         extended = True
-                        pw, ph = b[2] | b[3] << 8, b[4] | b[5] << 8
-                        up = int.from_bytes(b[6:10], "little")
-                        rssi = int.from_bytes(b[10:12], "little", signed=True)
-                        vbat = int.from_bytes(b[12:14], "little")
-                        lastr = {0: "OK", 1: "TIMEOUT", 2: "ERR", 0xFF: "-"}.get(b[14], b[14])
-                        lastms = int.from_bytes(b[15:19], "little")
+                        pw, ph = b[3] | b[4] << 8, b[5] | b[6] << 8
+                        up = int.from_bytes(b[7:11], "little")
+                        rssi = int.from_bytes(b[11:13], "little", signed=True)
+                        vbat = int.from_bytes(b[13:15], "little")
+                        fwv = b[15] | b[16] << 8
+                        lastr = {0: "OK", 1: "TIMEOUT", 2: "ERR", 0xFF: "-"}.get(b[18], b[18])
+                        lastms = int.from_bytes(b[19:23], "little")
                         rssi_s = f"{rssi} dBm" if rssi != 0x7FFF else "—"
-                        L(f"  ✓ 확장모드 · 패널 {pw}x{ph} · uptime {up}s · "
-                          f"RSSI {rssi_s} · VBAT {vbat} mV · 직전표시 {lastr}/{lastms}ms")
+                        L(f"  ✓ 확장모드 · 패널 {pw}x{ph} · uptime {up}s · RSSI {rssi_s} · "
+                          f"VBAT {vbat} mV · fw {fwv>>8}.{fwv&0xFF} · 직전표시 {lastr}/{lastms}ms")
                     else:
                         L(f"  확장 응답 형식 예상외(type={b[0]:#x}) — 블라인드 전송")
                 except socket.timeout:
@@ -687,11 +700,11 @@ def run_gui(initial=None):
                 s.settimeout(30)
 
                 if clear:
-                    s.sendall(_hdr(1, 0x0F, 0, 0, w, h))
-                    s.sendall(_hdr(4, 0, 0, 0, w, h))
+                    s.sendall(_hdr(1, 0x0F, 0, 0, w, h))   # FILL (응답 없음)
+                    s.sendall(_hdr(4, 0, 0, 0, w, h))      # DISPLAY
                     L("  cmd1 fill(흰색) + cmd4 display 전송")
                     if extended:
-                        read_ack("지움")
+                        read_display("지움")
 
                 s.sendall(_hdr(2, 0x0F, 0, 0, w, h))
                 L(f"  cmd2 load {w}x{h}, payload {len(payload):,} B 전송 시작")
@@ -704,11 +717,13 @@ def run_gui(initial=None):
                 dt = _time.time() - ts
                 mbps = total * 8 / dt / 1e6 if dt > 0 else 0
                 L(f"  payload 완료: {dt:.2f}s, {mbps:.1f} Mbps")
+                if extended:
+                    read_load()                          # LOAD 결과 (10B)
 
                 s.sendall(_hdr(4, 0, 0, 0, w, h))
                 L("  cmd4 display 전송")
                 if extended:
-                    read_ack("표시")
+                    read_display("표시")
                     L(f"완료 ✓ 전체 {_time.time()-t0:.2f}s", "#1a7a1a")
                 else:
                     L(f"완료 ✓ (블라인드) 전체 {_time.time()-t0:.2f}s", "#1a7a1a")
