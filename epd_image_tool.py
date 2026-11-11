@@ -38,7 +38,10 @@ import threading
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 TCP_PORT = 8319                                        # firmware listens here
-IP_MEMO = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_ip")
+# Packaged as an .exe, __file__ is a temp dir wiped on exit: keep it by the exe.
+_APP_DIR = os.path.dirname(os.path.abspath(
+    sys.executable if getattr(sys, "frozen", False) else __file__))
+IP_MEMO = os.path.join(_APP_DIR, ".last_ip")
 
 
 def _hdr(cmd, color, x, y, w, h):
@@ -284,6 +287,16 @@ def run_gui(initial=None):
     root.title("EPD Image Tool - 16계조 변환")
     root.geometry("1180x740")
     root.minsize(960, 580)
+    try:                                               # title bar / taskbar icon
+        logo = Image.open(os.path.join(getattr(sys, "_MEIPASS", _APP_DIR),
+                                       "docs", "Arevision_Logo_Small.png"))
+        side = max(logo.size)                          # pad to a square
+        icon = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        icon.paste(logo, ((side - logo.width) // 2, (side - logo.height) // 2))
+        root._icon = ImageTk.PhotoImage(icon)
+        root.iconphoto(True, root._icon)
+    except OSError:
+        pass                                           # logo missing: default icon
 
     st = {"src": None, "src_path": None, "src_gray": None, "levels": None,
           "display": None, "job": None, "out_scale": 1.0, "out_pos": (0, 0),

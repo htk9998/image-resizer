@@ -4,3 +4,7 @@ __pycache__/
 out/
 *.bin
 .last_ip
+# PyInstaller
+build/
+dist/
+*.spec
