@@ -278,6 +278,94 @@ def _save_ip(ip):
         pass
 
 
+def _local_ipv4():
+    """This PC's IPv4 addresses (no loopback / link-local)."""
+    ips = set()
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    try:                                               # the default-route interface
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            u.connect(("192.0.2.1", 9))                # no packet is sent
+            ips.add(u.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(i for i in ips if not i.startswith(("127.", "169.254.")))
+
+
+def _probe_board(ip, port=None):
+    """None if nothing listens on the EPD port, else a description string.
+
+    Sends STATUS? (cmd 0x21): gateway-protocol firmware answers with its
+    panel size; legacy firmware stays silent but the open port still counts.
+    """
+    try:
+        # a board on busy WiFi was seen taking ~1.1 s to accept
+        s = socket.create_connection((ip, port or TCP_PORT), timeout=2.0)
+    except OSError:
+        return None
+    with s:
+        try:
+            s.settimeout(2.5)
+            s.sendall(_hdr(0x21, 0, 0, 0, 0, 0))
+            b = b""
+            while len(b) < 23:
+                c = s.recv(23 - len(b))
+                if not c:
+                    break
+                b += c
+        except OSError:
+            b = b""
+    if len(b) == 23 and b[0] == 0x03:
+        return f"패널 {b[3] | b[4] << 8}x{b[5] | b[6] << 8}"
+    return "응답 없음(레거시 펌웨어?)"
+
+
+def _scan_nets(mine):
+    """The subnet of each local address, from ipconfig's mask (fallback /24).
+
+    A subnet wider than /22 is narrowed to the /22 around the PC so a scan
+    stays a few seconds; boards further away need their IP typed in.
+    """
+    import ipaddress, re, subprocess
+    masks = {}
+    try:
+        out = subprocess.run(["ipconfig"], capture_output=True, text=True, errors="replace",
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        last = None                                    # mask line follows its address
+        for a in re.findall(r"\d+\.\d+\.\d+\.\d+", out):
+            if a in mine:
+                last = a
+            elif last and a.startswith("255."):
+                masks[last], last = a, None
+    except OSError:
+        pass
+    nets = []
+    for ip in mine:
+        try:
+            net = ipaddress.ip_network(f"{ip}/{masks.get(ip, '255.255.255.0')}", strict=False)
+        except ValueError:
+            net = ipaddress.ip_network(f"{ip}/24", strict=False)
+        if net.prefixlen < 22:
+            net = ipaddress.ip_network(f"{ip}/22", strict=False)
+        if net.num_addresses > 2 and net not in nets:  # /32 (VPN) has no neighbours
+            nets.append(net)
+    return nets
+
+
+def find_boards():
+    """Scan each local subnet. Returns (scanned nets, [(ip, description)])."""
+    from concurrent.futures import ThreadPoolExecutor
+    mine = _local_ipv4()
+    nets = _scan_nets(mine)
+    targets = [str(h) for net in nets for h in net.hosts()]
+    targets = [t for t in dict.fromkeys(targets) if t not in mine]
+    with ThreadPoolExecutor(max_workers=256) as ex:
+        found = [(t, d) for t, d in zip(targets, ex.map(_probe_board, targets)) if d]
+    return [str(n) for n in nets], found
+
+
 def run_gui(initial=None):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
@@ -369,7 +457,10 @@ def run_gui(initial=None):
     ttk.Separator(side).pack(fill="x", pady=8)
     f = row("보드 IP")
     ip_var = tk.StringVar(value=_load_ip())
-    ttk.Entry(f, textvariable=ip_var, width=16).pack(side="left", fill="x", expand=True)
+    ip_box = ttk.Combobox(f, textvariable=ip_var, width=13)
+    ip_box.pack(side="left", fill="x", expand=True)
+    find_btn = ttk.Button(f, text="찾기", width=5, command=lambda: do_find())
+    find_btn.pack(side="left", padx=(4, 0))
     clr_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(side, text="전송 전 흰색으로 지우기", variable=clr_var).pack(anchor="w")
     send_btn = ttk.Button(side, text="▶ 보드로 전송", command=lambda: do_send())
@@ -749,6 +840,33 @@ def run_gui(initial=None):
             L(f"전송 실패: {type(e).__name__}: {e}", "#c0392b")
         finally:
             root.after(0, send_done)
+
+    # ---- find boards on the local network (background thread) ------------
+    def find_done(nets, found):
+        find_btn.config(state="normal", text="찾기")
+        if not nets:
+            log("보드 찾기: 이 PC에 네트워크 연결이 없습니다", "#c0392b"); return
+        log(f"  스캔 범위  {', '.join(nets)}")
+        for ip, desc in found:
+            log(f"  발견  {ip}  ({desc})")
+        ip_box["values"] = [ip for ip, _ in found]
+        if found:
+            ip_var.set(found[0][0])
+            log(f"보드 {len(found)}대 발견 → {found[0][0]} 선택", "#1a7a1a")
+        else:
+            log("보드를 찾지 못했습니다 (같은 WiFi인지, 보드 전원/접속 확인)", "#c0392b")
+
+    def do_find():
+        find_btn.config(state="disabled", text="…")
+        log(f"── 보드 찾기  (PC {', '.join(_local_ipv4()) or '-'}, 포트 {TCP_PORT}) ──")
+        def work():
+            try:
+                nets, found = find_boards()
+            except Exception as e:                      # noqa
+                root.after(0, log, f"보드 찾기 실패: {type(e).__name__}: {e}", "#c0392b")
+                nets, found = ["?"], []
+            root.after(0, find_done, nets, found)
+        threading.Thread(target=work, daemon=True).start()
 
     def do_send():
         if st["levels"] is None:
